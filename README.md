@@ -49,8 +49,8 @@ docker compose up --build
 
 服务在 <http://localhost:8000> 启动，交互式文档：<http://localhost:8000/docs>。
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
-启动方式无需改动，新增的 `POST /api/v1/audits/diff` 与 `POST /api/v1/audits/json`
-随服务一起可用（均通过宿主机 8000 端口访问）。
+启动方式无需改动，新增的 `POST /api/v1/audits/diff`、`POST /api/v1/audits/json`
+与 `POST /api/v1/audits/gate` 随服务一起可用（均通过宿主机 8000 端口访问）。
 
 ### 仅用 Docker
 
@@ -69,6 +69,16 @@ pip install -r requirements.txt
 # 或：
 BIDI_DB_PATH=./data/audit.db python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+### 配置与端口
+
+| 项 | 说明 |
+|---|---|
+| 端口 | 服务固定监听容器内 **8000**；Compose / `docker run -p 8000:8000` 映射到宿主机同端口。健康检查 `GET http://localhost:8000/health`，交互文档 `http://localhost:8000/docs` |
+| `BIDI_DB_PATH` | SQLite 数据库文件路径，默认 `/data/audit.db`（Compose 挂载命名卷 `bidi-audit-data`）；本地运行可指向 `./data/audit.db`。容器启动时自动执行 `python -m app.init_db` 初始化 schema，无需手动建库 |
+
+无论哪种方式都是一条命令启动（`docker compose up --build` / `./run.sh`），
+所有接口（含风险门禁 `POST /api/v1/audits/gate`）在 8000 端口立即可用。
 
 ## API
 
@@ -675,6 +685,135 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 "
 ```
 
+### `POST /api/v1/audits/gate` — 按文件路径的风险门禁
+
+对一组**已存储**的审计记录按其文件路径执行**风险门禁（risk gate）**，
+用于在流水线中决定「这批审计结果能否放行」。接口**只读**：不创建、
+不改写、不删除任何记录，只读取每条记录已有的 `risk_level` 与 `filename`。
+
+请求体：
+
+- `ids` — 要检查的已存审计 ID 列表（1–500 个，均 ≥ 1），响应中的
+  `items` 按此顺序逐一返回；允许重复 ID（重复出现就重复判定）。
+- `default_max_risk` — **默认允许的最高风险**
+  （`info | low | medium | high | critical`）。记录**没有文件名**、或
+  文件名**未命中任何规则**时使用该阈值。
+- `rules` — **有序路径规则**数组（可省略，表示只有默认阈值），每条规则：
+  - `template` — 路径模板，按 `/` 分段，使用 glob 风格匹配：
+    - `*` 匹配**单个段内**的任意字符（**不会跨越 `/`**），因此
+      `src/*` 匹配 `src/app.py` 但不匹配 `src/lib/app.py`，`*.py`
+      匹配 `app.py` 但不匹配 `src/app.py`；
+    - `**` 匹配**零段或多段整段**（可以跨越 `/`），例如 `src/**/*.py`
+      同时匹配 `src/app.py` 与 `src/a/b/app.py`，`a/**/z` 同时匹配
+      `a/z` 与 `a/b/c/z`；
+    - 其余字符（含 `?`、`[`、`.`）一律按字面量匹配，不做路径归一化
+      （前导 `/`、连续 `/` 都按原样分段）。
+  - `max_risk` — 命中此模板的路径所允许的最高风险。
+
+**规则选择（多条同时命中时）**依次比较：
+
+1. **固定段最多**——段不等于整段 `**` 就算固定段（字面段与含 `*` 的段
+   都算），所以越具体的规则越优先于靠 `**` 跨目录的宽泛规则；
+2. 固定段相同则比**模板总段数**，段数多者胜；
+3. 仍相同则取**请求中靠前**的规则。
+
+判定按 `info < low < medium < high < critical` 的顺序：记录的实际风险
+**不高于**阈值即通过（相等也算通过）。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/audits/gate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ids": [101, 102, 103, 104],
+    "default_max_risk": "medium",
+    "rules": [
+      {"template": "src/**/*.py", "max_risk": "high"},
+      {"template": "**/*.md",     "max_risk": "low"}
+    ]
+  }' | jq
+```
+
+响应：
+
+```json
+{
+  "default_max_risk": "medium",
+  "rules": [
+    {"index": 0, "template": "src/**/*.py", "max_risk": "high"},
+    {"index": 1, "template": "**/*.md", "max_risk": "low"}
+  ],
+  "passed": false,
+  "result": "failed",
+  "checked": 4,
+  "passed_count": 3,
+  "failed_count": 1,
+  "highest_risk": "critical",
+  "items": [
+    {
+      "id": 101,
+      "filename": "src/app.py",
+      "actual_risk": "info",
+      "max_risk": "high",
+      "threshold_source": "rule",
+      "matched": true,
+      "matched_rule_index": 0,
+      "matched_template": "src/**/*.py",
+      "passed": true
+    },
+    {
+      "id": 102,
+      "filename": "src/evil.py",
+      "actual_risk": "high",
+      "max_risk": "high",
+      "threshold_source": "rule",
+      "matched": true,
+      "matched_rule_index": 0,
+      "matched_template": "src/**/*.py",
+      "passed": true
+    },
+    {
+      "id": 103,
+      "filename": "docs/README.md",
+      "actual_risk": "critical",
+      "max_risk": "low",
+      "threshold_source": "rule",
+      "matched": true,
+      "matched_rule_index": 1,
+      "matched_template": "**/*.md",
+      "passed": false
+    },
+    {
+      "id": 104,
+      "filename": null,
+      "actual_risk": "info",
+      "max_risk": "medium",
+      "threshold_source": "default",
+      "matched": false,
+      "matched_rule_index": null,
+      "matched_template": null,
+      "passed": true
+    }
+  ]
+}
+```
+
+字段说明：
+
+- 每个 `items[]` 元素给出该 ID 的**命中规则**（`matched_rule_index` /
+  `matched_template`，未命中或无文件名时为 `null`）、**实际风险**
+  `actual_risk`、生效阈值 `max_risk`、阈值来源 `threshold_source`
+  （`rule` / `default`）以及是否通过 `passed`。
+- 顶层 `passed` / `result`（`passed` / `failed`）是**整体结论**：所有
+  记录都通过才为通过；`highest_risk` 是本批记录实际风险的最高值，
+  `checked` / `passed_count` / `failed_count` 为计数汇总。
+
+错误情况：
+
+| 状态码 | 条件 |
+|---|---|
+| `404` | `ids` 中任一 ID 不存在（`{"detail": "audit record <id> not found"}`，报告遍历到的第一个缺失 ID；只读，不产生任何副作用） |
+| `422` | `ids` 为空、含非正整数或缺失；`default_max_risk` / 规则的 `max_risk` 不是五个合法级别；规则 `template` 为空串等 Pydantic 校验失败 |
+
 ### 其他
 
 - `GET /health` — 健康检查（容器 HEALTHCHECK 使用）
@@ -690,6 +829,7 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 │   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
 │   ├── json_audit.py  # 严格 JSON 解析（位置跟踪/转义解码/重复键）+ 字符串值回映射
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
+│   ├── gate.py        # 路径风险门禁：glob 模板（* 单段 / ** 跨段）选规则与放行判定
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
 │   ├── sarif.py       # 已存审计 -> SARIF 2.1.0（rule/result、UTF-16 列、指纹）
 │   ├── database.py    # SQLite schema / CRUD / 查询（含可选 meta_json）
@@ -702,6 +842,7 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 │   ├── test_diff_audit.py # unified diff 审计（解析/回映射/422/落库）
 │   ├── test_json_audit.py # JSON 文档审计（指针/偏移/转义/代理对/重复键/422）
 │   ├── test_compare.py # 回归比较接口测试（新增/消失/位移/配对范围/404/422）
+│   ├── test_gate.py    # 路径风险门禁测试（模板匹配/三级 tie-break/默认阈值/只读/404/422）
 │   ├── test_verify.py  # 重算校验接口测试（一致/篡改/缺失 vs null/只读/404）
 │   └── test_sarif.py  # SARIF 导出测试（level 映射/UTF-16 列/指纹/排序/404）
 ├── Dockerfile
@@ -743,7 +884,13 @@ JSON 文档审计覆盖字符串值递归审计（键不审计）、RFC 6901 指
 多行文档行列、根字符串、纯标量零记录、逐值落库与文件名 `#指针` 规则、
 记录 verify/sarif 一致，以及 422 分支（空文档、截断、非法转义、`\u` 非十六进制、
 孤立高/低代理项、字符串内未转义控制字符、数字格式错误、尾随内容、嵌套超深、
-重复键含解码后重复与嵌套重复——均不落库）。
+重复键含解码后重复与嵌套重复——均不落库）；
+路径风险门禁覆盖 `*` 单段内匹配（不跨 `/`）、`**` 零段/多段匹配、
+字面量与相邻 `**` 折叠等模板语义，规则选择的三级 tie-break（固定段数、
+模板总段数、请求先后）、无文件名/未命中回落默认阈值、阈值边界相等即通过、
+整体结论与最高风险汇总、响应顺序与重复 ID、只读性（判定不改写记录、
+不新增记录），以及 404（任一 ID 不存在、报告首个缺失 ID）与 422
+（空 ids、非法风险级别、空模板、字段缺失/类型错误）。
 
 ## 设计说明
 

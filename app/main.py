@@ -11,6 +11,7 @@ from .bidi import RiskLevel, parse_bidi
 from .compare import compare_audits
 from .database import count_audits, get_audit, init_db, insert_audit, query_audits
 from .diff_audit import DiffParseError, audit_diff, highest_risk
+from .gate import gate_records
 from .json_audit import (
     DuplicateKeyError,
     JsonParseError,
@@ -22,6 +23,7 @@ from .schemas import (
     AuditRequest,
     CompareRequest,
     DiffAuditRequest,
+    GateRequest,
     JsonAuditRequest,
 )
 from .verify import verify_audit_record
@@ -75,6 +77,36 @@ def compare_records(payload: CompareRequest) -> dict:
     if after is None:
         raise HTTPException(status_code=404, detail="after audit record not found")
     return compare_audits(before, after)
+
+
+@app.post("/api/v1/audits/gate")
+def gate_audits(payload: GateRequest) -> dict:
+    """Apply a path-based risk gate to a set of stored audit records.
+
+    Each record's stored ``risk_level`` is compared against the highest
+    risk allowed for its file path: the request supplies a default
+    threshold plus an ordered list of path rules. A rule template is
+    split on ``/`` (``*`` matches one segment, ``**`` matches zero or
+    more); the most specific matching rule wins (most fixed segments,
+    then the longer template, then the earlier rule). Records without a
+    file name or without a matching rule use the default threshold.
+    Read-only: no record is created, modified or deleted. Any ID that
+    does not reference a stored record yields 404.
+    """
+    records = []
+    for audit_id in payload.ids:
+        record = get_audit(audit_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"audit record {audit_id} not found",
+            )
+        records.append(record)
+
+    rules = [(rule.template, rule.max_risk.value) for rule in payload.rules]
+    return gate_records(
+        records, rules=rules, default_max_risk=payload.default_max_risk.value
+    )
 
 
 @app.post("/api/v1/audits/diff", status_code=201)
@@ -290,6 +322,7 @@ def root() -> dict:
             "POST /api/v1/audits/diff",
             "POST /api/v1/audits/json",
             "POST /api/v1/audits/compare",
+            "POST /api/v1/audits/gate",
             "GET  /api/v1/audits",
             "GET  /api/v1/audits/{id}",
             "GET  /api/v1/audits/{id}/verify",
