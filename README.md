@@ -49,8 +49,8 @@ docker compose up --build
 
 服务在 <http://localhost:8000> 启动，交互式文档：<http://localhost:8000/docs>。
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
-启动方式无需改动，新增的 `POST /api/v1/audits/diff` 与 `POST /api/v1/audits/json`
-随服务一起可用（均通过宿主机 8000 端口访问）。
+启动方式无需改动，新增的 `POST /api/v1/audits/diff`、`POST /api/v1/audits/json`
+与 `POST /api/v1/audits/gate` 随服务一起可用（均通过宿主机 8000 端口访问）。
 
 ### 仅用 Docker
 
@@ -675,6 +675,103 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 "
 ```
 
+### `POST /api/v1/audits/gate` — 路径风险门禁
+
+对一组**已存储**的审计记录按文件路径执行风险门禁：每条记录按其存储的
+`filename` 匹配请求中的有序路径规则，命中规则的 `max_risk` 作为该记录允许
+的最高风险；记录没有文件名或文件名未命中任何规则时使用 `default_max_risk`。
+实际风险不超过阈值（按 `info < low < medium < high < critical` 排序）即判定
+通过。接口**只读**：不创建、不修改任何记录。
+
+请求体：
+
+```json
+{
+  "ids": [21, 22, 23],
+  "default_max_risk": "medium",
+  "rules": [
+    {"template": "**/*.py", "max_risk": "high"},
+    {"template": "docs/**", "max_risk": "info"},
+    {"template": "src/**/generated/*", "max_risk": "critical"}
+  ]
+}
+```
+
+模板匹配规则：
+
+- 模板与路径都按 `/` 分段；段内 `*` 匹配任意字符序列（不跨 `/`，故
+  `*.py` 只匹配一段文件名），独立的 `**` 段匹配**零段或多段**（`a/**/b`
+  同时匹配 `a/b`、`a/x/b`、`a/x/y/b`）；不含 `*` 的段按字面量精确匹配。
+- 一条路径命中多条规则时取**固定段（不含 `*` 的段）最多**者；固定段数相同
+  取**模板总段数多**者；仍相同取**请求中靠前**者。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/audits/gate \
+  -H 'Content-Type: application/json' \
+  -d '{"ids": [21, 22, 23], "default_max_risk": "medium",
+       "rules": [{"template": "**/*.py", "max_risk": "high"},
+                 {"template": "docs/**", "max_risk": "info"}]}' | jq
+```
+
+响应（节选）：
+
+```json
+{
+  "passed": false,
+  "default_max_risk": "medium",
+  "checked_count": 3,
+  "passed_count": 2,
+  "failed_count": 1,
+  "risk_level": "high",
+  "results": [
+    {
+      "id": 21,
+      "filename": "src/pkg/evil.py",
+      "actual_risk": "high",
+      "threshold": "high",
+      "matched_rule": {"index": 0, "template": "**/*.py", "max_risk": "high"},
+      "used_default": false,
+      "passed": true
+    },
+    {
+      "id": 22,
+      "filename": "docs/readme.md",
+      "actual_risk": "low",
+      "threshold": "info",
+      "matched_rule": {"index": 1, "template": "docs/**", "max_risk": "info"},
+      "used_default": false,
+      "passed": false
+    },
+    {
+      "id": 23,
+      "filename": null,
+      "actual_risk": "info",
+      "threshold": "medium",
+      "matched_rule": null,
+      "used_default": true,
+      "passed": true
+    }
+  ]
+}
+```
+
+说明：
+
+- `results` 按请求中 `ids` 的顺序返回；同一 ID 重复出现会逐次评估。
+- 每项的 `threshold` 是实际生效的阈值（命中规则的 `max_risk` 或默认阈值），
+  `matched_rule` 为命中的规则（含请求中的下标 `index`），未命中为 `null`
+  且 `used_default` 为 `true`。
+- 顶层 `passed` 为整体结论（全部记录通过才为 `true`）；`risk_level` 是全部
+  被检记录实际风险的最高值。
+- 文件名缺失（`null`）或纯空白时不参与规则匹配，直接使用默认阈值。
+
+错误情况：
+
+| 状态码 | 条件 |
+|---|---|
+| `404` | `ids` 中任一 ID 不存在（detail 含缺失的 ID，整个请求不返回部分结果） |
+| `422` | `ids` 为空、风险级别非法、模板为空串或请求体字段缺失 |
+
 ### 其他
 
 - `GET /health` — 健康检查（容器 HEALTHCHECK 使用）
@@ -690,6 +787,7 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 │   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
 │   ├── json_audit.py  # 严格 JSON 解析（位置跟踪/转义解码/重复键）+ 字符串值回映射
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
+│   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
 │   ├── sarif.py       # 已存审计 -> SARIF 2.1.0（rule/result、UTF-16 列、指纹）
 │   ├── database.py    # SQLite schema / CRUD / 查询（含可选 meta_json）
@@ -702,6 +800,7 @@ print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, ind
 │   ├── test_diff_audit.py # unified diff 审计（解析/回映射/422/落库）
 │   ├── test_json_audit.py # JSON 文档审计（指针/偏移/转义/代理对/重复键/422）
 │   ├── test_compare.py # 回归比较接口测试（新增/消失/位移/配对范围/404/422）
+│   ├── test_gate.py   # 路径风险门禁测试（模板匹配/优先级/默认阈值/只读/404/422）
 │   ├── test_verify.py  # 重算校验接口测试（一致/篡改/缺失 vs null/只读/404）
 │   └── test_sarif.py  # SARIF 导出测试（level 映射/UTF-16 列/指纹/排序/404）
 ├── Dockerfile
@@ -743,7 +842,11 @@ JSON 文档审计覆盖字符串值递归审计（键不审计）、RFC 6901 指
 多行文档行列、根字符串、纯标量零记录、逐值落库与文件名 `#指针` 规则、
 记录 verify/sarif 一致，以及 422 分支（空文档、截断、非法转义、`\u` 非十六进制、
 孤立高/低代理项、字符串内未转义控制字符、数字格式错误、尾随内容、嵌套超深、
-重复键含解码后重复与嵌套重复——均不落库）。
+重复键含解码后重复与嵌套重复——均不落库）；路径风险门禁覆盖段内 `*`
+（不跨 `/`，含 `*.py` 扩展名规则）、`**` 零段/一段/多段/连续 `**`/模板中部
+与边界匹配、固定段数优先、同固定段数时总段数优先、仍同分时请求靠前优先、
+未命中与无文件名回退默认阈值、阈值边界包含判定、风险排序与整体结论、
+结果按请求顺序与重复 ID、只读性，以及 404（含缺失 ID）与 422 分支。
 
 ## 设计说明
 

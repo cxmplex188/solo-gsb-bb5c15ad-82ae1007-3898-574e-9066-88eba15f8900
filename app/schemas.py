@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -61,5 +61,47 @@ class JsonAuditRequest(BaseModel):
         description=(
             "Optional document name. Stored records are named "
             "'<filename>#<json-pointer>' ('#<json-pointer>' when omitted)."
+        ),
+    )
+
+
+class GateRuleSpec(BaseModel):
+    template: str = Field(
+        ...,
+        min_length=1,
+        max_length=4096,
+        description=(
+            "Path template split on '/'. Within a segment '*' matches any "
+            "run of characters (never crossing '/'); a standalone '**' "
+            "segment matches zero or more segments. Segments without '*' "
+            "are literal matches."
+        ),
+    )
+    max_risk: RiskLevel = Field(
+        ..., description="Highest risk level allowed on paths matching this rule."
+    )
+
+
+class GateRequest(BaseModel):
+    ids: List[int] = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+        description="IDs of stored audit records to evaluate, in order.",
+    )
+    default_max_risk: RiskLevel = Field(
+        ...,
+        description=(
+            "Highest risk level allowed for records without a file name or "
+            "whose file name matches no rule."
+        ),
+    )
+    rules: List[GateRuleSpec] = Field(
+        default_factory=list,
+        max_length=500,
+        description=(
+            "Ordered path rules. For each record the matching rule with the "
+            "most literal segments wins; ties go to the template with more "
+            "total segments, then to the earlier rule."
         ),
     )

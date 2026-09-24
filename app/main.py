@@ -11,6 +11,7 @@ from .bidi import RiskLevel, parse_bidi
 from .compare import compare_audits
 from .database import count_audits, get_audit, init_db, insert_audit, query_audits
 from .diff_audit import DiffParseError, audit_diff, highest_risk
+from .gate import GateRule, evaluate_record
 from .json_audit import (
     DuplicateKeyError,
     JsonParseError,
@@ -22,6 +23,7 @@ from .schemas import (
     AuditRequest,
     CompareRequest,
     DiffAuditRequest,
+    GateRequest,
     JsonAuditRequest,
 )
 from .verify import verify_audit_record
@@ -75,6 +77,57 @@ def compare_records(payload: CompareRequest) -> dict:
     if after is None:
         raise HTTPException(status_code=404, detail="after audit record not found")
     return compare_audits(before, after)
+
+
+@app.post("/api/v1/audits/gate")
+def gate_records(payload: GateRequest) -> dict:
+    """Apply a path-based risk gate to a batch of stored audit records.
+
+    Read-only: no record is created or modified.  Each record is matched
+    against the ordered path rules on its stored file name; records without
+    a file name or whose file name matches nothing use the default maximum
+    risk.  A record passes when its actual risk does not exceed the
+    applicable threshold.  If any referenced ID does not exist the whole
+    request fails with 404.
+    """
+    rules = [
+        GateRule.make(index=i, template=spec.template,
+                      max_risk=spec.max_risk.value)
+        for i, spec in enumerate(payload.rules)
+    ]
+
+    # Resolve every record before evaluating anything so the endpoint never
+    # returns a partial report when an ID is missing.
+    records = []
+    for audit_id in payload.ids:
+        record = get_audit(audit_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"audit record {audit_id} not found",
+            )
+        records.append(record)
+
+    results = [
+        evaluate_record(
+            record,
+            default_max_risk=payload.default_max_risk.value,
+            rules=rules,
+        )
+        for record in records
+    ]
+
+    return {
+        "passed": all(item["passed"] for item in results),
+        "default_max_risk": payload.default_max_risk.value,
+        "checked_count": len(results),
+        "passed_count": sum(1 for item in results if item["passed"]),
+        "failed_count": sum(1 for item in results if not item["passed"]),
+        "risk_level": highest_risk(
+            [item["actual_risk"] for item in results]
+        ),
+        "results": results,
+    }
 
 
 @app.post("/api/v1/audits/diff", status_code=201)
@@ -290,6 +343,7 @@ def root() -> dict:
             "POST /api/v1/audits/diff",
             "POST /api/v1/audits/json",
             "POST /api/v1/audits/compare",
+            "POST /api/v1/audits/gate",
             "GET  /api/v1/audits",
             "GET  /api/v1/audits/{id}",
             "GET  /api/v1/audits/{id}/verify",
